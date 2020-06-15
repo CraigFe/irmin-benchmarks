@@ -1,18 +1,24 @@
-open Lwt.Infix
-
 let ( ++ ) = Int64.add
 
-type t = {
-  fd : Unix.file_descr;
-  mutable cursor : int64;
-  lwt_fd : Lwt_unix.file_descr;
-}
+module type S = sig
+  type t
 
-let v fd =
-  let lwt_fd = Lwt_unix.of_unix_file_descr ~blocking:false fd in
-  { fd; cursor = 0L; lwt_fd }
+  val v : Unix.file_descr -> t
 
-module Raw = struct
+  val close : t -> unit
+
+  val unsafe_write : t -> off:int64 -> string -> unit
+
+  val unsafe_read : t -> off:int64 -> len:int -> bytes -> int
+end
+
+module Raw_lseek : S = struct
+  type t = { fd : Unix.file_descr; mutable cursor : int64 }
+
+  let v fd = { fd; cursor = 0L }
+
+  let close { fd; _ } = Unix.close fd
+
   let really_write fd buf =
     let rec aux off len =
       let w = Unix.write fd buf off len in
@@ -40,7 +46,7 @@ module Raw = struct
     let buf = Bytes.unsafe_of_string buf in
     really_write t.fd buf;
     t.cursor <- off ++ Int64.of_int (Bytes.length buf);
-    t.cursor
+    ()
 
   let unsafe_read t ~off ~len buf =
     lseek t off;
@@ -49,87 +55,44 @@ module Raw = struct
     n
 end
 
-module Wrap_lwt_raw = struct
-  let really_write lwt_fd fd buf =
-    let rec aux off len =
-      Lwt_unix.wrap_syscall Lwt_unix.Write lwt_fd (fun () ->
-          Unix.write fd buf off len)
-      >>= fun w ->
-      if w = 0 || w = len then Lwt.return_unit
-      else (aux [@tailcall]) (off + w) (len - w)
-    in
-    (aux [@tailcall]) 0 (Bytes.length buf)
+module Raw_positioned : S = struct
+  type t = { fd : Unix.file_descr } [@@unboxed]
 
-  let really_read lwt_fd fd len buf =
-    let rec aux off len =
-      Lwt_unix.wrap_syscall Lwt_unix.Write lwt_fd (fun () ->
-          Unix.read fd buf off len)
-      >>= fun r ->
-      if r = 0 then Lwt.return off (* end of file *)
-      else if r = len then Lwt.return (off + r)
-      else (aux [@tailcall]) (off + r) (len - r)
-    in
-    (aux [@tailcall]) 0 len
+  let v fd = { fd }
 
-  let lseek t off =
-    if off = t.cursor then ()
-    else
-      let _ = Unix.LargeFile.lseek t.fd off Unix.SEEK_SET in
-      t.cursor <- off
+  let close { fd } = Unix.close fd
+
+  module Syscalls = Index_unix.Syscalls
+
+  let really_write fd fd_offset buffer =
+    let rec aux fd_offset buffer_offset length =
+      let w = Syscalls.pwrite ~fd ~fd_offset ~buffer ~buffer_offset ~length in
+      if w = 0 || w = length then ()
+      else
+        (aux [@tailcall])
+          (fd_offset ++ Int64.of_int w)
+          (buffer_offset + w) (length - w)
+    in
+    (aux [@tailcall]) fd_offset 0 (Bytes.length buffer)
+
+  let really_read fd fd_offset length buffer =
+    let rec aux fd_offset buffer_offset length =
+      let r = Syscalls.pread ~fd ~fd_offset ~buffer ~buffer_offset ~length in
+      if r = 0 then buffer_offset (* end of file *)
+      else if r = length then buffer_offset + r
+      else
+        (aux [@tailcall])
+          (fd_offset ++ Int64.of_int r)
+          (buffer_offset + r) (length - r)
+    in
+    (aux [@tailcall]) fd_offset 0 length
 
   let unsafe_write t ~off buf =
-    lseek t off;
     let buf = Bytes.unsafe_of_string buf in
-    really_write t.lwt_fd t.fd buf >|= fun () ->
-    t.cursor <- off ++ Int64.of_int (Bytes.length buf);
-    t.cursor
+    really_write t.fd off buf
 
-  let unsafe_read t ~off ~len buf =
-    lseek t off;
-    really_read t.lwt_fd t.fd len buf >|= fun n ->
-    t.cursor <- off ++ Int64.of_int n;
-    n
+  let unsafe_read t ~off ~len buf = really_read t.fd off len buf
 end
-
-module Lwt_raw = struct
-  let really_write fd buf =
-    let rec aux off len =
-      Lwt_unix.write fd buf off len >>= fun w ->
-      if w = 0 || w = len then Lwt.return_unit
-      else (aux [@tailcall]) (off + w) (len - w)
-    in
-    (aux [@tailcall]) 0 (Bytes.length buf)
-
-  let really_read fd len buf =
-    let rec aux off len =
-      Lwt_unix.read fd buf off len >>= fun r ->
-      if r = 0 then Lwt.return off (* end of file *)
-      else if r = len then Lwt.return (off + r)
-      else (aux [@tailcall]) (off + r) (len - r)
-    in
-    (aux [@tailcall]) 0 len
-
-  let lseek t off =
-    if off = t.cursor then ()
-    else
-      let _ = Unix.LargeFile.lseek t.fd off Unix.SEEK_SET in
-      t.cursor <- off
-
-  let unsafe_write t ~off buf =
-    lseek t off;
-    let buf = Bytes.unsafe_of_string buf in
-    really_write t.lwt_fd buf >|= fun () ->
-    t.cursor <- off ++ Int64.of_int (Bytes.length buf);
-    t.cursor
-
-  let unsafe_read t ~off ~len buf =
-    lseek t off;
-    really_read t.lwt_fd len buf >|= fun n ->
-    t.cursor <- off ++ Int64.of_int n;
-    n
-end
-
-type s = { file : string; mutable raw : t }
 
 let protect_unix_exn = function
   | Unix.Unix_error _ as e -> failwith (Printexc.to_string e)
@@ -158,132 +121,96 @@ let openfile file =
   let mode = Unix.O_RDWR in
   mkdir (Filename.dirname file);
   match Sys.file_exists file with
-  | false ->
-      let x = Unix.openfile file Unix.[ O_CREAT; mode; O_CLOEXEC ] 0o644 in
-      let raw = v x in
-      { file; raw }
-  | true ->
-      let x = Unix.openfile file Unix.[ O_EXCL; mode; O_CLOEXEC ] 0o644 in
-      let raw = v x in
-      { file; raw }
-
-let close t = Unix.close t.raw.fd
+  | false -> Unix.openfile file Unix.[ O_CREAT; mode; O_CLOEXEC ] 0o644
+  | true -> Unix.openfile file Unix.[ O_EXCL; mode; O_CLOEXEC ] 0o644
 
 let nb_elements = 10_000_000
 
-let element_size = 1_000
-
-let start_off = 200_000_000L
+let element_size = 100
 
 let random_char () = char_of_int (Random.int 256)
 
 let random_string () = String.init element_size (fun _i -> random_char ())
 
-(* let arr = ref [||] *)
+let time_in_ns f =
+  let clock = Mtime_clock.counter () in
+  let _ = f () in
+  Mtime_clock.count clock |> Mtime.Span.to_ns
 
-module Unix_bench = struct
-  open Raw
+module Bench (Raw : S) = struct
+  let read t ~off buf = Raw.unsafe_read t ~off ~len:(Bytes.length buf) buf
 
-  let read t ~off buf = unsafe_read t.raw ~off ~len:(Bytes.length buf) buf
+  let () = Random.self_init ()
 
-  let write t ~off buf = unsafe_write t.raw ~off buf
-
-  let write t =
-    let rec aux off i =
-      if i = nb_elements then ()
+  let write get_off t =
+    let rec aux stats i =
+      if i = nb_elements then stats
       else
         let random = random_string () in
-        let off = write t ~off random in
-        aux off (i + 1)
+        let off = get_off i in
+        let time = time_in_ns (fun () -> Raw.unsafe_write t ~off random) in
+        aux (Moments.add stats time) (i + 1)
     in
-    aux start_off 0
+    aux Moments.empty 0
 
-  let read t =
-    let rec aux off i =
-      if i = nb_elements then ()
+  let read get_off t =
+    let to_read = nb_elements in
+    let rec aux stats n =
+      if n = to_read then stats
       else
+        let off = get_off n in
         let buf = Bytes.create element_size in
-        let n = read t ~off buf in
-        aux (off ++ Int64.of_int n) (i + 1)
+        let time = time_in_ns (fun () -> read t ~off buf) in
+        aux (Moments.add stats time) (n + 1)
     in
-    aux start_off 0
+    aux Moments.empty 0
 
-  let with_timer f =
-    let t0 = Sys.time () in
-    let _ = f () in
-    Sys.time () -. t0
+  let random (_ : int) = Random.int nb_elements * element_size |> Int64.of_int
 
-  let bench () =
-    let t = openfile "store.pack" in
-    let write_time = with_timer (fun () -> write t) in
-    let read_time = with_timer (fun () -> read t) in
-    Fmt.epr
-      "unix sys call nb_elements = %d; element_size = %d\n\
-      \ write = %f, read = %f\n"
-      nb_elements element_size write_time read_time;
-    close t
+  let sequential i = i * element_size |> Int64.of_int
+
+  let remove_pack () = try Sys.remove "store.pack" with Sys_error _ -> ()
+
+  let with_raw f =
+    let raw = Raw.v (openfile "store.pack") in
+    let a = f raw in
+    Raw.close raw;
+    a
+
+  let bench impl () =
+    remove_pack ();
+
+    with_raw (fun t ->
+        let stats = write random t |> Moments.finalize in
+        Format.printf "%s,random_writes,%a\n%!" impl Moments.pp_stats stats);
+
+    remove_pack ();
+
+    with_raw (fun t ->
+        let stats = write sequential t |> Moments.finalize in
+        Format.printf "%s,sequential_writes,%a\n%!" impl Moments.pp_stats stats);
+
+    with_raw (fun t ->
+        let stats = read random t |> Moments.finalize in
+        Format.printf "%s,random_reads,%a\n%!" impl Moments.pp_stats stats);
+
+    with_raw (fun t ->
+        let stats = read sequential t |> Moments.finalize in
+        Format.printf "%s,sequential_reads,%a\n%!" impl Moments.pp_stats stats)
 end
 
-module Lwt_unix_bench = struct
-  let read ~wrap t ~off buf =
-    if wrap then Wrap_lwt_raw.unsafe_read t.raw ~off ~len:(Bytes.length buf) buf
-    else Lwt_raw.unsafe_read t.raw ~off ~len:(Bytes.length buf) buf
+module Raw_lseek_bench = Bench (Raw_lseek)
+module Raw_positioned_bench = Bench (Raw_positioned)
 
-  let write ~wrap t ~off buf =
-    if wrap then Wrap_lwt_raw.unsafe_write t.raw ~off buf
-    else Lwt_raw.unsafe_write t.raw ~off buf
-
-  let write ~wrap t =
-    let rec aux off i =
-      if i = nb_elements then Lwt.return_unit
-      else
-        let random = random_string () in
-        write ~wrap t ~off random >>= fun off -> aux off (i + 1)
-    in
-    aux start_off 0
-
-  let read ~wrap t =
-    let rec aux off i =
-      if i = nb_elements then Lwt.return_unit
-      else
-        let buf = Bytes.create element_size in
-        read ~wrap t ~off buf >>= fun n -> aux (off ++ Int64.of_int n) (i + 1)
-    in
-    aux start_off 0
-
-  let with_timer f =
-    let t0 = Sys.time () in
-    f () >|= fun () -> Sys.time () -. t0
-
-  let bench_wrap () =
-    let t = openfile "store.pack" in
-    with_timer (fun () -> write ~wrap:true t) >>= fun write_time ->
-    with_timer (fun () -> read ~wrap:true t) >|= fun read_time ->
-    Fmt.epr
-      "wrap_syscall unix sys call nb_elements = %d; element_size = %d\n\
-      \ write = %f, read = %f\n"
-      nb_elements element_size write_time read_time;
-    close t
-
-  let bench () =
-    let t = openfile "store.pack" in
-    with_timer (fun () -> write ~wrap:false t) >>= fun write_time ->
-    with_timer (fun () -> read ~wrap:false t) >|= fun read_time ->
-    Fmt.epr
-      "lwt_unix sys call nb_elements = %d; element_size = %d\n\
-      \ write = %f, read = %f\n"
-      nb_elements element_size write_time read_time;
-    close t
-end
-
-(* let count = ref 0 *)
+let rec repeat n f =
+  match n with
+  | 0 -> ()
+  | n ->
+      f ();
+      repeat (n - 1) f
 
 let () =
-  (* let r = random_string () in *)
-  (* arr := Array.make nb_elements r; *)
-  (* Fmt.epr "with array in memory\n"; *)
-  Unix_bench.bench ();
-  Lwt_main.run (Lwt_unix_bench.bench_wrap ());
-  Lwt_main.run (Lwt_unix_bench.bench ())
-
-(* Array.iter (fun i -> count := String.length i + !count) !arr *)
+  Format.printf "implementation,benchmark,count,mean(ns),variance(ns^2)\n";
+  repeat 5 (fun () ->
+      Raw_lseek_bench.bench "lseek" ();
+      Raw_positioned_bench.bench "positioned" ())
