@@ -2,3 +2,8 @@
  (name text_extract)
  (modules text_extract)
  (libraries cmdliner logs logs.fmt re))
+
+(executable
+ (name io_ops)
+ (modules io_ops moments)
+ (libraries lwt lwt.unix index.unix mtime))
